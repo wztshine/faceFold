@@ -27,7 +27,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 （uv 会自动下载所需的 Python 3.12 并创建虚拟环境，无需手动装 Python）
 
 ```bash
-git clone https://github.com/<你的用户名>/facefold.git
+git clone https://github.com/wztshine/faceFold.git
 cd facefold
 uv sync
 ```
