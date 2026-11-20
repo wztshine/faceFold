@@ -33,9 +33,11 @@ from face_common import (
     dominant_vectors,
     find_group_folder,
     load_gallery,
+    load_pending,
     load_person_names,
     save_gallery,
     save_person_names,
+    save_pending,
 )
 
 log = logging.getLogger("merge_groups")
@@ -48,6 +50,12 @@ def setup_logging() -> None:
     log.addHandler(h)
     log.setLevel(logging.INFO)
     log.propagate = False
+    # 挂接 face_common logger，否则其 WARNING（画廊保存失败等）落到 root 的
+    # lastResort 处理器输出到 stderr，与其他日志风格不一致
+    common = logging.getLogger("face_common")
+    common.addHandler(h)
+    common.setLevel(logging.INFO)
+    common.propagate = False
 
 
 def group_pair_similarity(ga: np.ndarray, gb: np.ndarray, threshold: float) -> tuple[float, float]:
@@ -120,7 +128,7 @@ def count_videos(folder: Path) -> int:
 
 def merge_two(gallery: dict[str, np.ndarray], output_dir: Path, keep: str, drop: str,
               person_names: dict[str, str] | None = None) -> None:
-    """把 drop 组的视频移入 keep 组，合并画廊向量。返回是否成功。"""
+    """把 drop 组的视频移入 keep 组，合并画廊向量。"""
     keep_folder = find_group_folder(output_dir, keep)
     drop_folder = find_group_folder(output_dir, drop)
     if keep_folder is None:
@@ -168,6 +176,8 @@ def main() -> None:
     parser.add_argument("output_dir", type=Path, help="groups 输出目录")
     parser.add_argument("--gallery", type=Path, default=None,
                         help="画廊文件，默认 ~/.face_video_group/face_gallery.npz（与 main.py 一致）")
+    parser.add_argument("--pending", type=Path, default=None,
+                        help="待移动视频列表，默认 output_dir/pending.txt（与 main.py 一致）")
     parser.add_argument("--sim_threshold", type=float, default=0.5,
                         help="两张人脸相似度达到多少算对得上（默认 0.5）")
     parser.add_argument("--coverage_ratio", type=float, default=0.5,
@@ -184,6 +194,7 @@ def main() -> None:
 
     output_dir = args.output_dir
     gallery_path = args.gallery or (Path.home() / ".face_video_group" / "face_gallery.npz")
+    pending_path = args.pending or (output_dir / "pending.txt")
 
     gallery = load_gallery(gallery_path)
     if not gallery:
@@ -226,8 +237,10 @@ def main() -> None:
 
     # 逐对确认并合并。每合并一对立即保存画廊，并重新计算候选，
     # 这样传递关系（A~B、B~C 但 A~C 相似度略低）也不会漏。
+    pending = load_pending(pending_path)
     rejected: set[frozenset[str]] = set()
     round_no = 0
+    merged_any = False
     while True:
         round_no += 1
         remaining = filter_mergeable_candidates(
@@ -252,10 +265,27 @@ def main() -> None:
         else:
             keep, drop = b, a
         merge_two(gallery, output_dir, keep, drop, person_names)
-        save_gallery(gallery, gallery_path)
+        merged_any = True
+        try:
+            save_gallery(gallery, gallery_path)
+        except Exception as e:
+            log.error("[画廊] 保存失败: %s: %s（视频已移动，画廊未落盘，建议修复后重跑）",
+                       type(e).__name__, e)
+        # pending.txt 中指向被合并（drop）组的记录重映射到保留组，避免留下死 gid
+        remapped = sum(1 for g in pending.values() if g == drop)
+        if remapped:
+            pending = {p: (keep if g == drop else g) for p, g in pending.items()}
+            save_pending(pending_path, pending)
+            log.info("[待定] pending.txt 中 %d 条记录已从 group_%s 重映射到 group_%s",
+                     remapped, drop, keep)
 
-    save_gallery(gallery, gallery_path)
-    if person_names:
+    try:
+        save_gallery(gallery, gallery_path)
+    except Exception as e:
+        log.error("[画廊] 保存失败: %s: %s", type(e).__name__, e)
+    # 发生过合并才写人名映射；即使映射被清空也要落盘（覆盖残留旧条目），
+    # 但文件本就不存在且映射为空时不创建新文件
+    if merged_any and (person_names or names_path.exists()):
         save_person_names(person_names, names_path)
     log.info("画廊已更新：%s（剩余 %d 个分组）", gallery_path, len(gallery))
 

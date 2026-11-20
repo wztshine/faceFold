@@ -28,11 +28,19 @@ import sys
 import time
 import traceback
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 import cv2
 import insightface
 import numpy as np
+
+try:
+    import msvcrt  # Windows 控制台 UTF-16 写入用；非 Windows 平台没有此模块
+    _HAS_MSVCRT = True
+except ImportError:
+    msvcrt = None
+    _HAS_MSVCRT = False
 
 from face_common import (
     dedup_against_gallery,
@@ -40,10 +48,12 @@ from face_common import (
     find_group_folder,
     gid_of,
     load_gallery,
+    load_pending,
     load_person_names,
     person_folder_name,
     save_gallery,
     save_person_names,
+    save_pending,
 )
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv", ".m4v", ".webm", ".mpg", ".mpeg"}
@@ -52,18 +62,28 @@ log = logging.getLogger("face_group")
 
 
 def setup_logging(log_file: Path | None = None) -> None:
-    """配置日志：控制台只显示 INFO 以上（干净），日志文件记录全部 DEBUG 细节。"""
+    """配置日志：控制台只显示 INFO 以上（干净），日志文件记录全部 DEBUG 细节。
+
+    同时挂接 face_common logger：它自身无 handler，否则 WARNING（画廊保存失败等）
+    会落到 root 的 lastResort 处理器写 stderr，而 main.py 已把 C 层 stderr 重定向
+    到 DEVNULL，这些告警会被静默吞掉。
+    """
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(fmt)
     console.setLevel(logging.INFO)
     log.addHandler(console)
+    common = logging.getLogger("face_common")
+    common.addHandler(console)
+    common.setLevel(logging.INFO)
+    common.propagate = False
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setFormatter(fmt)
         fh.setLevel(logging.DEBUG)
         log.addHandler(fh)
+        common.addHandler(fh)
     log.setLevel(logging.DEBUG)
     log.propagate = False
 
@@ -111,8 +131,8 @@ def console_stderr(message: str) -> None:
 
 
 def _console_write(fd: int, message: str) -> bool:
-    """用 UTF-16 写控制台；fd 不是交互式控制台时返回 False 交由调用方处理。"""
-    if not os.isatty(fd):
+    """用 UTF-16 写控制台；fd 不是交互式控制台或非 Windows 时返回 False 交由调用方处理。"""
+    if not _HAS_MSVCRT or not os.isatty(fd):
         return False
     try:
         handle = msvcrt.get_osfhandle(fd)
@@ -236,7 +256,9 @@ def extract_embeddings(
         cap.release()
         return np.empty((0, 512), dtype=np.float32)
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps != fps or fps <= 0:  # 0 / NaN / 负值（损坏文件的异常元数据）
+        fps = 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     frame_step = max(1, int(round(fps * frame_interval)))
 
@@ -246,7 +268,7 @@ def extract_embeddings(
     if max_faces > 0 and total_frames > 0:
         interval = frame_interval
         min_interval = 0.5  # 下限：最多每秒 2 帧，太密无意义
-        while frame_interval > min_interval:
+        while interval > min_interval:
             step = max(1, int(round(fps * interval)))
             if total_frames // step >= max_faces:
                 break
@@ -291,10 +313,11 @@ def extract_embeddings(
                 return np.empty((0, 512), dtype=np.float32)
             target += frame_step
             continue
+        frame_failures = 0  # 成功即清零：阈值针对“连续”失败，而非全程累计
 
         n_accepted = 0
         for face in faces:
-            # 质量过滤：低置信度 / 小脸直接丢弃（P1）
+            # 质量过滤：低置信度 / 小脸直接丢弃
             det_score = float(getattr(face, "det_score", 0.0))
             if det_score < min_det_score:
                 continue
@@ -352,9 +375,9 @@ def extract_embeddings(
 
 
 def aggregate_embeddings(embs: np.ndarray, scores: np.ndarray, dedup_threshold: float = 0.5) -> np.ndarray:
-    """把视频内同一人的多个向量聚合成一个代表向量。
+    """把视频内同一人的多个向量聚集成一个代表向量。
 
-    改进（P2/P3）：
+    做法：
     1. 按 det_score 从高到低排序，让高质量脸先成为簇种子（避免第一张模糊脸定代表）
     2. 贪心聚类：与已有簇代表相似度 > 阈值则归入该簇
     3. 每簇取向量平均并 L2 归一化，作为该人的代表（比单帧稳定）
@@ -362,7 +385,7 @@ def aggregate_embeddings(embs: np.ndarray, scores: np.ndarray, dedup_threshold: 
     if len(embs) == 0:
         return np.empty((0, 512), dtype=np.float32)
 
-    # 按质量排序，先处理可靠的脸（P3）
+    # 按质量排序，先处理可靠的脸
     order = np.argsort(-scores)
     embs = embs[order]
 
@@ -397,40 +420,41 @@ def aggregate_embeddings(embs: np.ndarray, scores: np.ndarray, dedup_threshold: 
     return np.asarray(reps, dtype=np.float32)
 
 
-def load_pending(pending_path: Path) -> dict[str, str]:
-    """加载待移动视频映射 {绝对路径: gid}。
+def _gid_sort_key(name: str) -> tuple[int, str]:
+    gid = gid_of(name)
+    if gid is not None:
+        try:
+            return (int(gid), name)
+        except ValueError:
+            pass
+    return (1 << 62, name)
 
-    格式：每行 "路径<TAB>gid"。旧格式（只有路径无 gid）兼容处理，gid 留空。
+
+def print_grouped(
+    title: str,
+    grouped: dict[str, list[str]],
+    ungrouped: list[str] | None = None,
+    header: Callable[[str], str] | None = None,
+) -> None:
+    """按分组打印日志：每组一个标题、组内每条日志一行，未归组项单独一节。
+
+    header 用于把 gid 显示为文件夹名（如 group_003 / 3_张三），默认原样。
     """
-    if not pending_path.exists():
-        return {}
-    result: dict[str, str] = {}
-    try:
-        with pending_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if "\t" in line:
-                    p_str, gid = line.split("\t", 1)
-                else:
-                    p_str, gid = line, ""
-                p = Path(p_str)
-                if p.exists():
-                    result[str(p.resolve())] = gid
-    except Exception as e:
-        log.warning("[待定] 读取失败: %s", e)
-    return result
-
-
-def save_pending(pending_path: Path, pending: dict[str, str]) -> None:
-    pending_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with pending_path.open("w", encoding="utf-8") as f:
-            for p_str, gid in sorted(pending.items()):
-                f.write(f"{p_str}\t{gid}\n")
-    except Exception as e:
-        log.warning("[待定] 写入失败: %s", e)
+    sections: list[tuple[str, list[str]]] = []
+    for gname in sorted(grouped, key=_gid_sort_key):
+        label = header(gname) if header else gname
+        sections.append((f"[{label}]", grouped[gname]))
+    if ungrouped:
+        sections.append(("[未分组]", ungrouped))
+    if not sections:
+        return
+    log.info("")
+    log.info("===== %s（按分组）=====", title)
+    for gname, items in sections:
+        log.info("")
+        log.info("%s %d 条", gname, len(items))
+        for item in items:
+            log.info("  - %s", item)
 
 
 def match_video_to_gallery(
@@ -445,8 +469,9 @@ def match_video_to_gallery(
 
     只与每组的主体簇比较，避免被组内混入的次要人脸/背景人脸误导：
     要求视频中至少有 video_match_ratio 比例的向量能匹配上该组主体簇（相似度 >= threshold）。
-    匹配打分用 top-k 人脸的平均相似度（比单点 max 更稳，P7），
-    并支持 margin：第一候选须明显优于第二候选，否则不归组（减少边界误并）。
+    匹配打分用 top-k 人脸的平均相似度（比单点 max 更稳），
+    并支持 margin：第一候选须明显优于第二候选，否则不并入该候选组、
+    由调用方为其新建独立分组（事后可用 merge_groups.py 合并）。
     返回 (组名, 最高平均相似度)。"""
     scored: list[tuple[str, float, float]] = []  # (gname, topk_score, best_sim)
     for gname, dom in dominants.items():
@@ -490,6 +515,24 @@ def next_group_index(gallery: dict[str, np.ndarray], output_dir: Path) -> int:
     return (max(idxs) + 1) if idxs else 0
 
 
+def unique_dest_path(group_dir: Path, name: str) -> Path:
+    """目标已存在时返回不冲突的路径，如 "video (1).mp4"；否则原样返回。"""
+    dest = group_dir / name
+    if not dest.exists():
+        return dest
+    dot = name.rfind(".")
+    if dot > 0:
+        stem, suffix = name[:dot], name[dot:]
+    else:
+        stem, suffix = name, ""
+    i = 1
+    while True:
+        candidate = group_dir / f"{stem} ({i}){suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
 def make_model(device: int) -> insightface.app.FaceAnalysis:
     # 只加载 detection + recognition + genderage：
     # - 跳过 landmark_3d_68 / landmark_2d_106（识别用检测的 5 点关键点对齐，不依赖它们）
@@ -528,11 +571,11 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=3,
                         help="匹配打分取最像的多少张人脸求平均（默认 3）")
     parser.add_argument("--margin", type=float, default=0.0,
-                        help="匹配时第一候选与第二候选的最小得分差，不足则不归组（默认 0=关闭）")
+                        help="匹配时第一候选与第二候选的最小得分差，不足则不并入该候选组、改为新建独立分组（默认 0=关闭）")
     parser.add_argument("--max_faces", type=int, default=15,
                         help="一个视频检出多少帧符合过滤条件的人脸就提前结束，0=不限（默认 15）")
-    parser.add_argument("--gender", type=str, default="all", choices=["all", "male", "female"],
-                        help="按性别过滤人脸：all=不过滤 / male=只保留男性 / female=只保留女性（默认 all）")
+    parser.add_argument("--gender", type=str, default="female", choices=["all", "male", "female"],
+                        help="按性别过滤人脸：all=不过滤 / male=只保留男性 / female=只保留女性（默认 female）")
     parser.add_argument("--no_face_window", type=int, default=2,
                         help="连续多少次采样无人脸就判定进入无人脸段，然后跳过一个采样间隔（默认 2）")
     parser.add_argument("--skip_seconds", type=float, default=2.0,
@@ -569,6 +612,8 @@ def main() -> None:
         log.error("输入目录不存在: %s", args.input_dir)
         sys.exit(1)
 
+    log.info("")
+    log.info("===== 启动 =====")
     videos = get_video_files(args.input_dir)
     log.info("共发现 %d 个视频文件", len(videos))
 
@@ -593,17 +638,26 @@ def main() -> None:
     # 需要处理的视频 = 输入目录中的 + 待移动的（去重）
     all_videos: list[Path] = list(videos)
     seen = {str(v.resolve()) for v in videos}
-    pending_paths: list[Path] = []
     for p_str in pending:
         p = Path(p_str)
         if str(p.resolve()) not in seen:
             all_videos.append(p)
             seen.add(str(p.resolve()))
-        pending_paths.append(p)
     # pending 视频已有稳定 gid 的沿用（不重新匹配，避免自我匹配到上次建的组）；
-    # gid 为空的是旧格式（只有路径无 gid），需要重新匹配
-    pending_stable: dict[str, str] = {k: v for k, v in pending.items() if v}
-    pending_rematch: set[str] = {str(p.resolve()) for p in pending_paths if pending.get(str(p.resolve())) == ""}
+    # gid 为空（旧格式）或画廊中已不存在（如分组已被 merge_groups 合并掉）的重新匹配。
+    # 画廊文件存在却读不出（疑似损坏，已备份 .corrupt）时沿用旧 gid：
+    # 此时重新匹配只会给所有 pending 视频误建新组，等画廊恢复更安全。
+    gallery_file_exists = gallery_path.exists()
+
+    def _gid_alive(gid: str) -> bool:
+        if not gid:
+            return False
+        if gallery:
+            return gid in gallery
+        return gallery_file_exists
+
+    pending_stable: dict[str, str] = {p: g for p, g in pending.items() if _gid_alive(g)}
+    pending_rematch: set[str] = {p for p, g in pending.items() if p not in pending_stable}
 
     log.info("加载 insightface 模型（buffalo_l）...")
     app = make_model(args.device)
@@ -636,6 +690,8 @@ def main() -> None:
     skipped = 0
 
     # ---- 阶段 1：分组（只记录归属，不移动） ----
+    log.info("")
+    log.info("===== 阶段 1/2：特征提取与匹配 =====")
     video_assign: list[tuple[Path, str] | None] = [None] * len(all_videos)
 
     # 主体簇缓存：只重算被更新的组（其他组保持不变，避免每视频全量重算）
@@ -643,18 +699,29 @@ def main() -> None:
         g: dominant_vectors(v, args.cluster_threshold) for g, v in gallery.items()
     }
 
+    # 按分组收集阶段 1 的日志：{gid: [该组每条视频的处理结果]}
+    stage1_groups: dict[str, list[str]] = {}
+    stage1_ungrouped: list[str] = []
+
     for i, video in enumerate(all_videos):
-        key = emb_cache_key(video)
+        try:
+            key = emb_cache_key(video)
+        except OSError:
+            # 视频在运行中被删除/移走：跳过本次，不留进度也不入 pending
+            log.warning("[跳过] %s 无法访问（文件已被移动或删除？）", video.name)
+            continue
         vres = str(video.resolve())
         # 已稳定分组的 pending 视频：沿用上次 gid，跳过重新匹配（避免自我匹配）
         if vres in pending_stable:
             gid = pending_stable[vres]
             video_assign[i] = (video, gid)
-            log.info("[%d/%d] 沿用 %s -> group_%s（等待补移）", i + 1, len(all_videos), video.name, gid)
+            stage1_groups.setdefault(gid, []).append(f"{video.name}  沿用上次分组（等待补移）")
+            log.info("[%d/%d] 处理 %s（沿用 group_%s）", i + 1, len(all_videos), video.name, gid)
             continue
         # 非 pending 且命中 progress：已处理，跳过
         if key in progress_keys and vres not in pending_rematch:
             skipped += 1
+            stage1_ungrouped.append(f"{video.name}  已处理，跳过")
             log.info("[%d/%d] 跳过 %s（已处理）", i + 1, len(all_videos), video.name)
             continue
 
@@ -666,6 +733,10 @@ def main() -> None:
                 args.no_face_window, args.skip_seconds, args.cluster_threshold, args.gender,
             )
         except Exception as e:
+            if isinstance(e, OSError) and not video.exists():
+                # 守卫通过后文件才消失（TOCTOU 窗口）：跳过，不重载模型、不记进度
+                log.warning("[跳过] %s 处理中无法访问（文件已被移动或删除？）", video.name)
+                continue
             log.warning("[跳过] %s 处理异常: %s: %s", video.name, type(e).__name__, e)
             log.info("[恢复] 重新加载模型后继续")
             try:
@@ -681,19 +752,19 @@ def main() -> None:
 
         # 无人脸：留在原地，但记录进度避免重复处理
         if len(embs) == 0:
-            log.info("[%d/%d] 无人脸 %s，留在原地", i + 1, len(all_videos), video.name)
+            stage1_ungrouped.append(f"{video.name}  无人脸，留在原地")
             rows.append({"video": video.name, "group": "", "moved_to": "", "note": "无人脸，未移动"})
             untouched += 1
             progress_keys.add(key)
             save_progress(progress_path, progress_keys)
             continue
 
-        # 匹配画廊：只与各分组的主体簇比较，避免被污染向量误导（P2）
+        # 匹配画廊：只与各分组的主体簇比较，避免被污染向量误导
         gid, sim = match_video_to_gallery(
             embs, dominants, args.sim_threshold, args.video_match_ratio, args.top_k, args.margin
         )
         if gid is not None and sim >= args.sim_threshold:
-            # 只并入与组主体簇达标的向量，防止次要人脸/背景人脸混入组（P1）
+            # 只并入与组主体簇达标的向量，防止次要人脸/背景人脸混入组
             group_vecs = gallery[gid]
             sims = dominants[gid] @ embs.T
             matched = embs[sims.max(axis=0) >= args.sim_threshold]
@@ -703,8 +774,9 @@ def main() -> None:
                 gallery[gid] = np.vstack([group_vecs, matched])
                 # 该组向量更新了，重算它的主体簇
                 dominants[gid] = dominant_vectors(gallery[gid], args.cluster_threshold)
-            log.info("[%d/%d] 归组 %s -> group_%s（相似度 %.3f，并入 %d 个向量）",
-                     i + 1, len(all_videos), video.name, gid, sim, len(matched))
+            stage1_groups.setdefault(gid, []).append(
+                f"{video.name}  相似度 {sim:.3f}，并入 {len(matched)} 个向量"
+            )
         else:
             # 进入这里：要么无候选组（sim=-1），要么被 margin 拒绝
             if sim < 0:
@@ -717,7 +789,7 @@ def main() -> None:
             # 新组也只存该视频的主体簇，避免"出生即带污染"（背景人脸混入）
             gallery[gid] = dominant_vectors(embs, args.cluster_threshold)
             dominants[gid] = gallery[gid]
-            log.info("[%d/%d] 新建 %s -> group_%s（%s）", i + 1, len(all_videos), video.name, gid, reason)
+            stage1_groups.setdefault(gid, []).append(f"{video.name}  {reason}")
 
         video_assign[i] = (video, gid)
         try:
@@ -725,7 +797,17 @@ def main() -> None:
         except Exception as e:
             log.warning("[画廊] 保存失败，将在后续视频处理时重试: %s: %s", type(e).__name__, e)
 
+    # ---- 阶段 1 结束：按分组打印归属结果 ----
+    print_grouped(
+        "阶段 1：特征提取与匹配结果",
+        stage1_groups,
+        stage1_ungrouped,
+        header=lambda g: person_folder_name(g, person_names),
+    )
+
     # ---- 阶段 2：移动决策 ----
+    log.info("")
+    log.info("===== 阶段 2/2：移动 =====")
     # 统计每个 gid 本次分到的视频数（含沿用的 pending 视频）
     gid_count: Counter[str] = Counter()
     for assign in video_assign:
@@ -734,11 +816,20 @@ def main() -> None:
 
     # 待移动的：本轮凑够 min_videos 就移动，否则留在原地并记录 gid
     remaining_pending: dict[str, str] = {}
+    # 按分组收集阶段 2 的日志：{gid: [该组每条视频的移动结果]}
+    stage2_groups: dict[str, list[str]] = {}
+    # 本运行实际发生了移动的分组：{gid: 移动视频数}
+    moved_groups: dict[str, int] = {}
     for assign in video_assign:
         if assign is None:
             continue
         video, gid = assign
-        key = emb_cache_key(video)
+        try:
+            key = emb_cache_key(video)
+        except OSError:
+            log.warning("[移动] %s 无法访问（文件已被移动或删除？），留待下次", video.name)
+            remaining_pending[str(video.resolve())] = gid
+            continue
 
         # 组文件夹已存在（历史批次已建立）：无条件移入，min_videos 只用于决定何时新建文件夹
         existing_dir = find_group_folder(output_dir, gid)
@@ -746,25 +837,52 @@ def main() -> None:
             # 文件夹还不存在且该组视频数不足：留在原地，记入待移动列表（含 gid）
             remaining_pending[str(video.resolve())] = gid
             rows.append({"video": video.name, "group": "", "moved_to": "", "note": f"仅本组 {gid_count[gid]} 个视频，未移动"})
-            log.info("[待定] %s -> group_%s（仅 %d 个视频，未达 min_videos=%d）",
-                     video.name, gid, gid_count[gid], args.min_videos)
+            stage2_groups.setdefault(gid, []).append(
+                f"{video.name}  待定（本组仅 {gid_count[gid]} 个视频，未达 min_videos={args.min_videos}）"
+            )
             untouched += 1
             continue
 
         # 移动视频：优先用已存在的（可能是重命名过的）文件夹，否则用 人名_gid 或默认 group_{gid}
         group_dir = existing_dir or (output_dir / person_folder_name(gid, person_names))
         group_dir.mkdir(parents=True, exist_ok=True)
-        dest = group_dir / video.name
-        if video.exists():
+        dest = unique_dest_path(group_dir, video.name)
+        if dest.name != video.name:
+            log.warning("[改名] %s 目标已存在，移动到 %s", video.name, dest.name)
+        try:
             shutil.move(str(video), str(dest))
-        rows.append({"video": video.name, "group": group_dir.name, "moved_to": str(dest), "note": ""})
-        log.info("[移动] %s -> %s/", video.name, group_dir.name)
+        except OSError as e:
+            log.warning("[移动] %s 移动失败: %s: %s（留待下次）", video.name, type(e).__name__, e)
+            remaining_pending[str(video.resolve())] = gid
+            rows.append({"video": video.name, "group": group_dir.name, "moved_to": "",
+                         "note": f"移动失败: {type(e).__name__}"})
+            stage2_groups.setdefault(gid, []).append(f"{video.name}  移动失败（{type(e).__name__}）")
+            untouched += 1
+            continue
+        note = f"目标已存在，重命名为 {dest.name}" if dest.name != video.name else ""
+        rows.append({"video": video.name, "group": group_dir.name, "moved_to": str(dest), "note": note})
+        stage2_groups.setdefault(gid, []).append(f"{video.name} -> {group_dir.name}/{dest.name}")
         grouped += 1
+        moved_groups[gid] = moved_groups.get(gid, 0) + 1
 
         # 移动成功后补记进度，避免下次重复处理
         progress_keys.add(key)
         save_progress(progress_path, progress_keys)
 
+    # ---- 阶段 2 结束：按分组打印移动结果 ----
+    print_grouped(
+        "阶段 2：移动结果",
+        stage2_groups,
+        header=lambda g: person_folder_name(g, person_names),
+    )
+    # 汇总：本次有新视频移入的分组
+    if moved_groups:
+        log.info("")
+        log.info("===== 本次有新视频移入的分组 =====")
+        for gid in sorted(moved_groups, key=_gid_sort_key):
+            log.info("[%s] 移入 %d 个新视频", person_folder_name(gid, person_names), moved_groups[gid])
+    else:
+        log.info("（本次无视频移动）")
     save_pending(pending_path, remaining_pending)
     if remaining_pending:
         log.info("另有 %d 个视频因分组视频数不足留在原地，已记入待移动列表", len(remaining_pending))
@@ -778,6 +896,8 @@ def main() -> None:
         save_gallery(gallery, gallery_path)
     except Exception as e:
         log.error("[画廊] 最终保存失败: %s: %s", type(e).__name__, e)
+    log.info("")
+    log.info("===== 完成 =====")
     log.info("完成：%d 个视频已移动，%d 个留在原地，%d 个已处理跳过。画廊 %d 个分组，报告：%s",
              grouped, untouched, skipped, len(gallery), report_path)
 

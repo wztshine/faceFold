@@ -1,7 +1,8 @@
 """纯 numpy/标准库工具，供 main.py 与 merge_groups.py 共享。
 
 不依赖 cv2 / insightface / onnxruntime，使 merge_groups 这类后处理工具
-无需加载重型视觉库即可运行。
+无需加载重型视觉库即可运行。scipy 为可选加速依赖（insightface 已自带），
+未安装时自动退回纯 Python 实现，功能不受影响。
 """
 
 from __future__ import annotations
@@ -27,6 +28,39 @@ def dedup_against_gallery(embs: np.ndarray, group_vecs: np.ndarray, near_dup: fl
     return embs[keep]
 
 
+def _connected_labels(adj: np.ndarray) -> np.ndarray:
+    """求无向图的连通分量标记（等价于 union-find）。
+
+    大图（>=128 个向量）优先用 scipy 的 C 实现：O(n^2) 的纯 Python 双循环
+    在大分组上要跑几十万次迭代，且每次组更新都会重算；scipy 快 1~2 个数量级。
+    未安装 scipy 或图很小时用纯 Python union-find，保持轻量依赖。
+    """
+    n = adj.shape[0]
+    if n >= 128:
+        try:
+            from scipy.sparse import csr_matrix
+            from scipy.sparse.csgraph import connected_components
+        except ImportError:
+            pass
+        else:
+            _, labels = connected_components(csr_matrix(adj), directed=False)
+            return labels
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if adj[i, j]:
+                parent[find(i)] = find(j)
+    return np.array([find(i) for i in range(n)], dtype=np.int64)
+
+
 def dominant_vectors(embs: np.ndarray, link: float) -> np.ndarray:
     """提取分组的"主体簇"：组内向量按相似度 >= link 连成连通分量，取最大的分量。
 
@@ -46,22 +80,11 @@ def dominant_vectors(embs: np.ndarray, link: float) -> np.ndarray:
     adj = sims >= link
     np.fill_diagonal(adj, False)
 
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            if adj[i, j]:
-                parent[find(i)] = find(j)
+    labels = _connected_labels(adj)
 
     comps: dict[int, list[int]] = {}
-    for i in range(n):
-        comps.setdefault(find(i), []).append(i)
+    for i, lab in enumerate(labels):
+        comps.setdefault(int(lab), []).append(i)
 
     best: np.ndarray | None = None
     for members in comps.values():
@@ -103,13 +126,15 @@ def gid_of(name: str) -> str | None:
 
     优先采用"id 在前"格式（如 '4_张三'、'5_Ella-Rose'）：取第一个 _ 之前的段。
     若该段不是纯数字（旧格式 '张三_4'），回退到遍历各段找唯一的数字段。
+    返回值统一去掉前导零（'04' -> '4'），保证与画廊键/人名映射可直接比较，
+    也让手动改名为 group_05 的文件夹仍能被正确关联。
     """
     parts = name.split("_")
     if parts and parts[0].isdigit():
-        return parts[0]
+        return str(int(parts[0]))
     digits = [p for p in parts if p.isdigit()]
     if len(digits) == 1:
-        return digits[0]
+        return str(int(digits[0]))
     return None
 
 
@@ -133,16 +158,19 @@ def load_gallery(gallery_path: Path) -> dict[str, np.ndarray]:
         return {}
 
     def _read() -> dict[str, np.ndarray]:
-        data = np.load(gallery_path, allow_pickle=True)
-        try:
-            gallery: dict[str, np.ndarray] = {}
-            for k in data.files:
-                gid = gid_of(k)
-                if gid is not None:
-                    gallery[gid] = data[k].astype(np.float32)
-            return gallery
-        finally:
-            data.close()
+        # 用 with 持有文件句柄：坏 zip 抛异常时句柄也能关闭，
+        # 避免泄漏的句柄在 Windows 上阻塞后续 os.replace
+        with open(gallery_path, "rb") as f:
+            data = np.load(f, allow_pickle=True)
+            try:
+                gallery: dict[str, np.ndarray] = {}
+                for k in data.files:
+                    gid = gid_of(k)
+                    if gid is not None:
+                        gallery[gid] = data[k].astype(np.float32)
+                return gallery
+            finally:
+                data.close()
 
     try:
         return _read()
@@ -173,7 +201,8 @@ def save_gallery(gallery: dict[str, np.ndarray], gallery_path: Path) -> None:
     gallery_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = gallery_path.with_name(gallery_path.name + ".tmp")
     with tmp.open("wb") as f:
-        np.savez_compressed(f, **gallery)
+        # 不压缩：画廊逐视频保存，压缩整个画廊在大画廊上是 O(n^2) 的累计开销
+        np.savez(f, **gallery)
         f.flush()
         os.fsync(f.fileno())
     last_err: OSError | None = None
@@ -190,7 +219,10 @@ def save_gallery(gallery: dict[str, np.ndarray], gallery_path: Path) -> None:
 
 
 def load_person_names(names_path: Path) -> dict[str, str]:
-    """加载人物名映射 {人物id: 人名}。文件不存在或损坏时返回空字典（不报错）。"""
+    """加载人物名映射 {人物id: 人名}。文件不存在或损坏时返回空字典（不报错）。
+
+    数字键统一去掉前导零（"04" -> "4"），与 gid_of 的返回值保持一致。
+    """
     if names_path is None or not names_path.exists():
         return {}
     try:
@@ -199,7 +231,13 @@ def load_person_names(names_path: Path) -> dict[str, str]:
         if not isinstance(data, dict):
             log.warning("[人名] 格式错误，应为 JSON 对象，按空处理")
             return {}
-        return {str(k): str(v) for k, v in data.items() if v}
+        names: dict[str, str] = {}
+        for k, v in data.items():
+            if not v:
+                continue
+            key = str(k).strip()
+            names[str(int(key)) if key.isdigit() else str(k)] = str(v)
+        return names
     except Exception as e:
         log.warning("[人名] 读取失败 %s，按空处理: %s", names_path.name, e)
         return {}
@@ -217,6 +255,46 @@ def save_person_names(names: dict[str, str], names_path: Path) -> None:
         os.replace(tmp, names_path)
     except Exception as e:
         log.warning("[人名] 写入失败: %s", e)
+
+
+def load_pending(pending_path: Path) -> dict[str, str]:
+    """加载待移动视频映射 {绝对路径: gid}。
+
+    格式：每行 "路径<TAB>gid"。旧格式（只有路径无 gid）兼容处理，gid 留空。
+    gid 统一去掉前导零，与画廊键一致。
+    """
+    if not pending_path.exists():
+        return {}
+    result: dict[str, str] = {}
+    try:
+        with pending_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if "\t" in line:
+                    p_str, gid = line.split("\t", 1)
+                    gid = gid.strip()
+                    if gid.isdigit():
+                        gid = str(int(gid))
+                else:
+                    p_str, gid = line, ""
+                p = Path(p_str)
+                if p.exists():
+                    result[str(p.resolve())] = gid
+    except Exception as e:
+        log.warning("[待定] 读取失败: %s", e)
+    return result
+
+
+def save_pending(pending_path: Path, pending: dict[str, str]) -> None:
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with pending_path.open("w", encoding="utf-8") as f:
+            for p_str, gid in sorted(pending.items()):
+                f.write(f"{p_str}\t{gid}\n")
+    except Exception as e:
+        log.warning("[待定] 写入失败: %s", e)
 
 
 def person_folder_name(gid: str, names: dict[str, str]) -> str:
