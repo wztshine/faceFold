@@ -6,6 +6,49 @@
 
 ---
 
+## 快速开始（从零开始，3 步）
+
+### 第 1 步：安装 [uv](https://docs.astral.sh/uv/)（Python 包管理器）
+
+Windows（PowerShell）：
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+macOS / Linux：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### 第 2 步：下载项目并安装依赖
+
+（uv 会自动下载所需的 Python 3.12 并创建虚拟环境，无需手动装 Python）
+
+```bash
+git clone https://github.com/<你的用户名>/face_video_group.git
+cd face_video_group
+uv sync
+```
+
+### 第 3 步：运行
+
+把下面的路径换成你自己的视频目录（支持 mp4/mov/avi/mkv 等常见格式）：
+
+```bash
+uv run python main.py "D:\videos"
+```
+
+跑完后 `D:\videos\groups` 下就是按人物分好的文件夹，每个文件夹 = 一个人。
+
+- 有 NVIDIA / AMD 独显：默认自动走 GPU（DirectML，**无需安装 CUDA**）
+- 无独显：加 `--device -1` 用 CPU（慢一些，能用）
+- 首次运行会自动下载人脸模型 buffalo_l（约 340MB）到 `~/.insightface/models/`
+- 推荐加 `--log` 保存日志，便于回看进度：`uv run python main.py "D:\videos" --log "D:\videos\run.log"`
+
+---
+
 ## 功能特性
 
 - **人脸检测 + 特征提取**：对视频抽帧，用 insightface 检出所有人脸，提取 512 维特征向量
@@ -22,9 +65,9 @@
 
 ## 环境要求
 
-- Windows（脚本针对 Windows 编码做了处理，其他平台也可运行）
-- Python 3.12（uv 管理）
-- GPU：支持 DirectML 的 NVIDIA GPU（本项目用 onnxruntime-directml，无需安装 CUDA Toolkit）
+- Windows（主要开发与测试环境；代码已做跨平台兼容处理，Linux/macOS 理论可运行但未经充分测试）
+- Python 3.12（uv 自动管理，无需手动安装）
+- GPU：可选。NVIDIA / AMD 独显走 DirectML（无需安装 CUDA Toolkit）；无独显加 `--device -1` 用 CPU
 
 ### 安装
 
@@ -35,18 +78,16 @@ uv sync
 
 依赖：`insightface`、`onnxruntime-directml`、`opencv-python`、`numpy`。
 
-首次运行会自动下载模型 `buffalo_l`（约 340MB）到 `~/.insightface/models/`。
-
 ---
 
 ## 快速开始
 
 ```bash
-# 处理 D:/videos 下的所有视频，输出到 D:/videos\groups
-uv run python main.py "D:/videos"
+# 处理 D:\videos 下的所有视频，输出到 D:\videos\groups
+uv run python main.py "D:\videos"
 
 # 带日志文件（推荐，便于查看进度）
-uv run python main.py "D:/videos" --log "D:/videos\run.log"
+uv run python main.py "D:\videos" --log "D:\videos\run.log"
 ```
 
 运行后 `D:/videos\groups` 下会生成：
@@ -83,12 +124,12 @@ groups/
 - `2.0` = 每 2 秒取 1 帧；`1.0` = 每 1 秒取 1 帧（更密，更慢）
 - 间隔越大越快，但太大会漏掉短暂出现的人脸。建议 `1.0 ~ 3.0`
 
-#### `--max_faces`（默认 `10`）
+#### `--max_faces`（默认 `15`）
 
 **早停阈值**：累计检出多少帧人脸后**提前停止**该视频。
 
 - 单人/双人视频通常前几十帧就有足够人脸，无需跑完整视频
-- `10` = 累计检出 10 帧人脸就停止该视频；`0` = 不限，跑完整视频
+- `15` = 累计检出 15 帧人脸就停止该视频；`0` = 不限，跑完整视频
 - 搭配 `--frame_interval` 可显著加速长视频
 - 注意：统计的是"累计检出人脸帧数"，双人视频每帧 +2，会比单人更快达到阈值
 - 视频都很短（<30 秒）可设 `0` 不限，反正跑完也快
@@ -139,20 +180,29 @@ groups/
 
 **人脸最小尺寸**：bbox 短边小于该像素数的太小的人脸丢弃（小脸 embedding 不可靠）。
 
-#### `--no_face_window`（默认 `5`）
+#### `--no_face_window`（默认 `2`）
 
 **无人脸段判定窗口**：连续多少次采样都没有"通过质量过滤的人脸"，判定进入无人脸段。
 
-- 例如默认 `5`：连续 5 次采样（如每 2 秒一次 → 约 10 秒）都没检到合格人脸
+- 例如默认 `2`：连续 2 次采样（如每 2 秒一次 → 约 4 秒）都没检到合格人脸
 - 对转场、空镜、黑屏等无人脸镜头段有效
 
-#### `--skip_seconds`（默认 `10`）
+#### `--skip_seconds`（默认 `2`）
 
 **无人脸段跳过的秒数**：判定进入无人脸段后，一次性向后跳过该秒数再继续采样。
 
-- 例如默认 `10`：跳过 10 秒，避免逐帧检测无人脸的段落
+- 例如默认 `2`：跳过约一个采样间隔，避免逐帧检测无人脸的段落
 - 与 `--no_face_window` 配合：`no_face_window` 决定"何时判定无人脸段"，`skip_seconds` 决定"跳过多远"
 - 碰到人脸后计数清零，恢复正常采样
+
+#### `--gender`（默认 `female`）
+
+**按性别过滤人脸**：用 genderage 模型判定每张脸的性别，只保留目标性别的脸。
+
+- `female` = 只保留女性 / `male` = 只保留男性 / `all` = 不过滤
+- **注意默认值是 `female`**：纯男性出镜的视频会显示"无人脸，留在原地"，需要处理男性视频时请显式传 `--gender all` 或 `--gender male`
+- `--max_faces` 早停和无人脸跳段都基于**过滤后**的人脸计数
+- 只影响提取哪些脸，不改变画廊里已有人物的特征（画廊无需重建）
 
 #### `--top_k`（默认 `3`）
 
@@ -160,7 +210,7 @@ groups/
 
 #### `--margin`（默认 `0`）
 
-**匹配置信度差**：第一候选与第二候选的得分差不足该值时，判定为边界情况、不归组（减少误并）。`0` = 关闭。
+**匹配置信度差**：第一候选与第二候选的得分差不足该值时，不并入该候选组，改为**新建独立分组**（事后可用 merge_groups.py 合并）。`0` = 关闭。
 
 ### 输出参数
 
@@ -170,6 +220,8 @@ groups/
 | `--report` | `output_dir/group_report.csv` | 分组报告 CSV 路径（视频 → 分组对照） |
 | `--gallery` | `~/.face_video_group/face_gallery.npz` | 画廊文件路径（人物特征库，默认在用户目录，跨目录共享） |
 | `--progress` | `output_dir/progress.txt` | 断点续跑进度文件路径 |
+| `--pending` | `output_dir/pending.txt` | 待移动视频列表路径 |
+| `--names` | `~/.face_video_group/person_names.json` | 人物名映射文件路径 |
 | `--cache_dir` | `output_dir/emb_cache` | 特征缓存目录 |
 
 ### 运行参数
@@ -242,7 +294,7 @@ group_1        -> 张三_1        （合法，脚本识别为分组 1）
 - **增量处理**：处理过的视频已移入分组文件夹（不在输入目录），新增视频放进 `input_dir` 再跑即可，只处理新视频
 - **待移动补移**：未达 `--min_videos` 的视频留在原地并记入 `pending.txt`，下次有同人新视频时自动一起补移
 - **缓存加速**：视频的向量缓存在 `emb_cache/`，重新处理时直接读缓存
-- **进度记录键** = 文件路径 + 大小 + 修改时间；特征缓存键还包含抽帧/过滤/聚合参数。视频内容或参数变了会自动失效重新处理
+- **进度记录键** = 文件路径 + 大小 + 修改时间；特征缓存键还包含抽帧/过滤/聚合参数。**视频内容**变了（大小/修改时间变化）会自动重跑；但**参数**变化只让特征缓存失效，已写入 `progress.txt` 的视频（含被判为"无人脸"的）仍会跳过，需手动删除对应记录才会重新处理
 
 > 若想强制重跑某个分组，删除对应记录：清空 `progress.txt`（全部重跑）或删除指定记录。
 
@@ -329,6 +381,7 @@ uv run python merge_groups.py "D:/videos\groups" --auto
 
 - 视频多的组保留，另一组视频移入（重名文件自动跳过不覆盖）
 - 画廊向量合并，被合并的空文件夹删除
+- `pending.txt` 中指向被合并组的记录自动重映射到保留组（不产生死 gid）
 - 每合并一对立即保存画廊，并重新计算候选直到没有新疑似组对（保证传递关系不漏）
 
 > **关于 `--cleanup-orphans`**：默认不清理"无文件夹的分组"——因为纯 pending 分组（视频未达 min_videos 未移动）本就没有文件夹，自动清理会误删其累积向量。仅在明确需要清理已合并残留时开启。
@@ -363,8 +416,27 @@ A：两种情况：① 视频未检出人脸；② 视频分到的组本轮视�
 face_video_group/
 ├── main.py            # 主脚本：分组 + 断点续跑 + 增量分类
 ├── merge_groups.py    # 后处理工具：合并被误拆的同一个人分组
+├── split_group.py     # 后处理工具：拆分被误并的分组
 ├── face_common.py     # 共享纯 numpy 工具（无重型视觉依赖）
+├── tests/             # 单元测试（无需 GPU/模型，秒级跑完）
 ├── pyproject.toml     # uv 项目配置
 ├── uv.lock            # 依赖锁定
-└── .venv/             # 虚拟环境
+└── LICENSE            # MIT
 ```
+
+---
+
+## 运行测试
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+测试不加载模型、不依赖 GPU，验证纯 numpy 逻辑（连通分量、画廊/待定文件读写、
+gid 解析等）与 merge/split 的文件操作，几秒内跑完。
+
+---
+
+## License
+
+[MIT](LICENSE)

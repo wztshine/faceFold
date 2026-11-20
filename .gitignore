@@ -11,3 +11,6 @@ wheels/
 
 # IDE
 .idea/
+
+# 本机个人启动脚本（含本机路径，不入库）
+run.bat
