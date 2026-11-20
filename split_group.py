@@ -5,7 +5,7 @@
 1. 最大的簇保留原分组文件夹；其余簇各新建分组文件夹并移动视频
 2. 按拆分后的归属**重建**画廊向量（原 gid 只保留其簇的向量，去掉污染）
 
-用法：
+用法:
     uv run python split_group.py "D:/videos/groups" --gid 12
     uv run python split_group.py "D:/videos/groups" --gid 12 --dry_run
     uv run python split_group.py "D:/videos/groups" --gid 12 --sim_threshold 0.5

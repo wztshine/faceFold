@@ -13,7 +13,7 @@
 5. 确认后合并：视频少的组移入保留组文件夹、合并画廊向量，每合并一对立即保存
 6. 合并后重新计算候选，直到没有新的疑似组对（保证传递关系不漏）
 
-用法：
+用法:
     uv run python merge_groups.py "D:/videos/groups"
     uv run python merge_groups.py "D:/videos/groups" --dry_run
     uv run python merge_groups.py "D:/videos/groups" --auto
