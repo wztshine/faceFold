@@ -60,6 +60,7 @@ uv run python main.py "D:\videos"
 - **断点续跑**：`progress.txt` 记录已处理视频，中断后重跑自动跳过
 - **特征缓存**：`emb_cache/` 缓存每个视频的向量，重复运行时秒过
 - **分组合并工具**：`merge_groups.py` 事后合并被误拆的同一个人分组（纯 numpy，无重型依赖）
+- **分组拆分工具**：`split_group.py` 事后拆分被误并的分组（重新提取向量做视频级聚类）
 
 ---
 
@@ -80,7 +81,7 @@ uv sync
 
 ---
 
-## 快速开始
+## 运行示例与输出说明
 
 ```bash
 # 处理 D:\videos 下的所有视频，输出到 D:\videos\groups
@@ -90,7 +91,7 @@ uv run python main.py "D:\videos"
 uv run python main.py "D:\videos" --log "D:\videos\run.log"
 ```
 
-运行后 `D:/videos\groups` 下会生成：
+运行后 `D:\videos\groups` 下会生成：
 
 ```
 groups/
@@ -237,19 +238,19 @@ groups/
 
 ```bash
 # 单人/双人视频 + 长视频提速：2 秒抽帧 + 检出 20 帧人脸即停
-uv run python main.py "D:/videos" --frame_interval 2.0 --max_faces 20
+uv run python main.py "D:\videos" --frame_interval 2.0 --max_faces 20
 
 # 同一人经常被拆成多人：降低匹配阈值
-uv run python main.py "D:/videos" --sim_threshold 0.42
+uv run python main.py "D:\videos" --sim_threshold 0.42
 
 # 不同人经常被误并：提高匹配阈值 + 提高匹配占比 + 开启 margin
-uv run python main.py "D:/videos" --sim_threshold 0.55 --video_match_ratio 0.6 --margin 0.05
+uv run python main.py "D:\videos" --sim_threshold 0.55 --video_match_ratio 0.6 --margin 0.05
 
 # 画质差/模糊脸多：提高质量过滤门槛
-uv run python main.py "D:/videos" --min_det_score 0.6 --min_face_size 48
+uv run python main.py "D:\videos" --min_det_score 0.6 --min_face_size 48
 
 # 新增视频增量处理（旧视频已处理会跳过）
-uv run python main.py "D:/videos" --log "D:/videos\run.log"
+uv run python main.py "D:\videos" --log "D:\videos\run.log"
 ```
 
 ---
@@ -341,13 +342,13 @@ group_1        -> 张三_1        （合法，脚本识别为分组 1）
 
 ```bash
 # 先看有哪些疑似同一人的组对（不执行合并）
-uv run python merge_groups.py "D:/videos\groups" --dry_run
+uv run python merge_groups.py "D:\videos\groups" --dry_run
 
 # 逐对确认合并
-uv run python merge_groups.py "D:/videos\groups"
+uv run python merge_groups.py "D:\videos\groups"
 
 # 自动合并所有候选（不确认）
-uv run python merge_groups.py "D:/videos\groups" --auto
+uv run python merge_groups.py "D:\videos\groups" --auto
 ```
 
 ### 参数
@@ -385,6 +386,40 @@ uv run python merge_groups.py "D:/videos\groups" --auto
 - 每合并一对立即保存画廊，并重新计算候选直到没有新疑似组对（保证传递关系不漏）
 
 > **关于 `--cleanup-orphans`**：默认不清理"无文件夹的分组"——因为纯 pending 分组（视频未达 min_videos 未移动）本就没有文件夹，自动清理会误删其累积向量。仅在明确需要清理已合并残留时开启。
+
+---
+
+## split_group.py：分组拆分工具
+
+当"一个分组里其实混了两个人"（误并）时，用于事后拆分。是 merge_groups 的逆操作。
+
+与合并工具不同：画廊向量是逐视频累积的、无法按视频切开，因此本工具会**重新提取该组每个视频的人脸向量**（复用 emb_cache，重复运行很快），做视频级聚类，确认后执行：
+
+- 最大的簇保留原分组文件夹；其余簇各新建分组并移动视频
+- 按拆分结果**重建**画廊向量（原组只保留其簇的向量，去掉污染）
+
+### 用法
+
+```bash
+# 先看拆分方案（不做任何改动）
+uv run python split_group.py "D:\videos\groups" --gid 12 --dry_run
+
+# 确认后执行（会展示方案并要求确认）
+uv run python split_group.py "D:\videos\groups" --gid 12
+```
+
+### 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `output_dir` | （必填） | groups 输出目录 |
+| `--gid` | （必填） | 要拆分的分组 id（文件夹名的数字后缀） |
+| `--gallery` | `~/.face_video_group/face_gallery.npz` | 画廊文件（与 main.py 一致） |
+| `--sim_threshold` | `0.5` | 两个视频算同一人所需的代表向量最大相似度 |
+| `--dry_run` | `false` | 只展示拆分方案，不移动视频、不写画廊 |
+| 其余 | 与 main.py 一致 | `--cluster_threshold` / `--gender` / `--frame_interval` 等特征提取参数 |
+
+拆分依赖视频之间本来就"不像"——若提示"只聚成一簇"（拆不动），可调低 `--sim_threshold`（如 `0.45`）再试；反过来若把同一人拆开了，调高它。
 
 ---
 
