@@ -16,13 +16,17 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import csv
 import hashlib
 import logging
+import msvcrt
 import onnxruntime
+import os
 import shutil
 import sys
 import time
+import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -62,6 +66,64 @@ def setup_logging(log_file: Path | None = None) -> None:
         log.addHandler(fh)
     log.setLevel(logging.DEBUG)
     log.propagate = False
+
+
+# 保存的原始 stderr fd：stderr 被重定向后，异常回溯与中断提示仍写到这里（原控制台）
+_SAVED_STDERR: int | None = None
+
+
+def redirect_stderr_to_devnull() -> None:
+    """把 C 层 stderr（fd 2）重定向到 DEVNULL，静音 ffmpeg 解码警告。
+
+    seek 到非关键帧时 H.264 解码器会向 stderr 刷 "co located POCs unavailable /
+    reference picture missing during reorder" 等警告（open GOP 的 B 帧引用缺失，
+    帧内容已验证正确，属无害噪声）。这些警告由 libav 直接写 C 层 stderr，且会延迟到
+    进程退出时补刷，OpenCV 的日志级别 / OPENCV_FFMPEG_CAPTURE_OPTIONS 都无法控制，
+    只能整个运行期重定向 fd 2。
+    Python 自身日志走 stdout/log 文件，不受影响；原始 stderr 存入 _SAVED_STDERR，
+    异常回溯与 [中断] 提示仍写到原控制台。
+    """
+    global _SAVED_STDERR
+    if _SAVED_STDERR is not None:
+        return
+    _SAVED_STDERR = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+
+
+def console_stderr(message: str) -> None:
+    """把消息写到原始 stderr，stderr 已被重定向时用。
+
+    Windows 控制台默认按代码页（如 GBK）解释字节，直接 os.write 的 UTF-8
+    字节会乱码，因此控制台场景走 WriteConsoleW（UTF-16，永不乱码）；
+    非控制台（重定向到文件/管道）才回退到 os.write 字节。
+    """
+    if _SAVED_STDERR is not None:
+        try:
+            if _console_write(_SAVED_STDERR, message):
+                return
+            os.write(_SAVED_STDERR, message.encode("utf-8", "replace"))
+            return
+        except OSError:
+            pass
+    sys.stderr.write(message)
+
+
+def _console_write(fd: int, message: str) -> bool:
+    """用 UTF-16 写控制台；fd 不是交互式控制台时返回 False 交由调用方处理。"""
+    if not os.isatty(fd):
+        return False
+    try:
+        handle = msvcrt.get_osfhandle(fd)
+        text = message.encode("utf-16-le")
+        written = ctypes.c_ulong(0)
+        ok = ctypes.windll.kernel32.WriteConsoleW(
+            handle, text, len(text) // 2, ctypes.byref(written), None
+        )
+        return bool(ok)
+    except (OSError, ValueError):
+        return False
 
 
 def get_video_files(src_dir: Path) -> list[Path]:
@@ -497,6 +559,11 @@ def main() -> None:
     progress_path = args.progress or (output_dir / "progress.txt")
     pending_path = args.pending or (output_dir / "pending.txt")
     setup_logging(args.log)
+    redirect_stderr_to_devnull()
+    # stderr 已重定向：未捕获异常的完整回溯仍写到原控制台，便于排查
+    sys.excepthook = lambda t, v, tb: console_stderr(
+        "".join(traceback.format_exception(t, v, tb))
+    )
 
     if not args.input_dir.is_dir():
         log.error("输入目录不存在: %s", args.input_dir)
@@ -653,7 +720,10 @@ def main() -> None:
             log.info("[%d/%d] 新建 %s -> group_%s（%s）", i + 1, len(all_videos), video.name, gid, reason)
 
         video_assign[i] = (video, gid)
-        save_gallery(gallery, gallery_path)
+        try:
+            save_gallery(gallery, gallery_path)
+        except Exception as e:
+            log.warning("[画廊] 保存失败，将在后续视频处理时重试: %s: %s", type(e).__name__, e)
 
     # ---- 阶段 2：移动决策 ----
     # 统计每个 gid 本次分到的视频数（含沿用的 pending 视频）
@@ -704,10 +774,18 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    save_gallery(gallery, gallery_path)
+    try:
+        save_gallery(gallery, gallery_path)
+    except Exception as e:
+        log.error("[画廊] 最终保存失败: %s: %s", type(e).__name__, e)
     log.info("完成：%d 个视频已移动，%d 个留在原地，%d 个已处理跳过。画廊 %d 个分组，报告：%s",
              grouped, untouched, skipped, len(gallery), report_path)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # 画廊/进度均逐视频保存，Ctrl+C 停止时当前状态已落盘，仅提示后退出
+        console_stderr("\n[中断] 已停止，已处理视频的进度与画廊均已保存。\n")
+        sys.exit(1)

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -120,24 +123,70 @@ def find_group_folder(output_dir: Path, gid: str) -> Path | None:
 
 
 def load_gallery(gallery_path: Path) -> dict[str, np.ndarray]:
-    """加载画廊：{gid: (N, 512) 向量矩阵}，键统一为数字后缀。不存在时返回空字典。"""
-    if gallery_path.exists():
+    """加载画廊：{gid: (N, 512) 向量矩阵}，键统一为数字后缀。不存在时返回空字典。
+
+    读取失败先短暂重试，排除刚停止的进程残留句柄 / 杀软扫描造成的瞬时锁；
+    确认损坏才把原文件**复制**备份为 .corrupt（不移动原文件），
+    避免把一次瞬时读失败误判成损坏、把完好的画廊改名弄丢。
+    """
+    if not gallery_path.exists():
+        return {}
+
+    def _read() -> dict[str, np.ndarray]:
+        data = np.load(gallery_path, allow_pickle=True)
         try:
-            data = np.load(gallery_path, allow_pickle=True)
             gallery: dict[str, np.ndarray] = {}
             for k in data.files:
                 gid = gid_of(k)
                 if gid is not None:
                     gallery[gid] = data[k].astype(np.float32)
             return gallery
-        except Exception as e:
-            log.warning("[画廊] 读取失败，按空画廊处理: %s", e)
+        finally:
+            data.close()
+
+    try:
+        return _read()
+    except Exception as e:
+        for _ in range(2):
+            time.sleep(0.2)
+            try:
+                return _read()
+            except Exception:
+                continue
+        log.warning("[画廊] 读取失败，按空画廊处理: %s", e)
+        backup = gallery_path.with_suffix(gallery_path.suffix + ".corrupt")
+        try:
+            shutil.copy2(gallery_path, backup)
+            log.warning("[画廊] 原文件已复制备份到 %s（主文件保留，下次保存会覆盖）", backup)
+        except Exception as backup_e:
+            log.warning("[画廊] 备份损坏文件失败: %s", backup_e)
     return {}
 
 
 def save_gallery(gallery: dict[str, np.ndarray], gallery_path: Path) -> None:
+    """原子保存画廊：先写临时文件并 fsync 落盘，再 os.replace 原子替换。
+
+    手动停止（Ctrl+C / kill）发生在任何一步都只会留下不完整的 .tmp，
+    主画廊文件始终是上一次完整的版本。Windows 上 os.replace 偶尔会被
+    杀软/索引器瞬时占用而失败，这里做短重试；仍失败则保留 .tmp 并抛给上层。
+    """
     gallery_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(gallery_path, **gallery)
+    tmp = gallery_path.with_name(gallery_path.name + ".tmp")
+    with tmp.open("wb") as f:
+        np.savez_compressed(f, **gallery)
+        f.flush()
+        os.fsync(f.fileno())
+    last_err: OSError | None = None
+    for attempt in range(3):
+        try:
+            os.replace(tmp, gallery_path)
+            return
+        except OSError as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(0.2)
+    log.warning("[画廊] 替换失败，临时文件保留在 %s（原文件未受影响）", tmp)
+    raise last_err
 
 
 def load_person_names(names_path: Path) -> dict[str, str]:
@@ -157,13 +206,15 @@ def load_person_names(names_path: Path) -> dict[str, str]:
 
 
 def save_person_names(names: dict[str, str], names_path: Path) -> None:
-    """保存人物名映射。文件目录不存在时创建。"""
+    """保存人物名映射。文件目录不存在时创建。先写临时文件再 rename，避免中途崩溃写坏。"""
     if names_path is None:
         return
     names_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = names_path.with_name(names_path.name + ".tmp")
     try:
-        with names_path.open("w", encoding="utf-8") as f:
+        with tmp.open("w", encoding="utf-8") as f:
             json.dump(names, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, names_path)
     except Exception as e:
         log.warning("[人名] 写入失败: %s", e)
 
