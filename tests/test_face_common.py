@@ -166,6 +166,39 @@ class TestPending(unittest.TestCase):
             self.assertEqual(load_pending(pp), {})
 
 
+class TestDefaultStateDir(unittest.TestCase):
+    """状态目录选择：新目录优先，旧目录存在时兼容沿用。"""
+
+    def _home(self, td: str, make: str) -> Path:
+        home = Path(td)
+        (home / make).mkdir(parents=True, exist_ok=True)
+        return home
+
+    def test_fresh_install_uses_new_dir(self):
+        import face_common as fc
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(fc.Path, "home", return_value=Path(td)):
+                self.assertEqual(fc.default_state_dir(), Path(td) / ".facefold")
+
+    def test_legacy_dir_is_used_when_present(self):
+        import face_common as fc
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            self._home(td, ".face_video_group")
+            with patch.object(fc.Path, "home", return_value=Path(td)):
+                self.assertEqual(fc.default_state_dir(), Path(td) / ".face_video_group")
+
+    def test_new_dir_wins_when_both_exist(self):
+        import face_common as fc
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            self._home(td, ".face_video_group")
+            self._home(td, ".facefold")
+            with patch.object(fc.Path, "home", return_value=Path(td)):
+                self.assertEqual(fc.default_state_dir(), Path(td) / ".facefold")
+
+
 class TestPersonNames(unittest.TestCase):
     def test_canonicalization_and_empty_drop(self):
         with tempfile.TemporaryDirectory() as td:

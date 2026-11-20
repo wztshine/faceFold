@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 
 from face_common import (
+    default_gallery_path,
+    default_names_path,
     find_group_folder,
     load_gallery,
     load_person_names,
@@ -99,7 +101,7 @@ def main() -> None:
     parser.add_argument("output_dir", type=Path, help="groups 输出目录")
     parser.add_argument("--gid", required=True, help="要拆分的分组 id（数字）")
     parser.add_argument("--gallery", type=Path, default=None,
-                        help="画廊文件，默认 ~/.face_video_group/face_gallery.npz（与 main.py 一致）")
+                        help="画廊文件，默认 ~/.facefold/face_gallery.npz（旧版 ~/.face_video_group 自动兼容，与 main.py 一致）")
     parser.add_argument("--sim_threshold", type=float, default=0.5,
                         help="两个视频算同一个人所需的最大相似度（默认 0.5）")
     parser.add_argument("--cluster_threshold", type=float, default=0.5,
@@ -118,12 +120,12 @@ def main() -> None:
     args = parser.parse_args()
 
     output_dir = args.output_dir
-    gallery_path = args.gallery or (Path.home() / ".face_video_group" / "face_gallery.npz")
+    gallery_path = args.gallery or default_gallery_path()
     cache_dir = args.cache_dir or (output_dir / "emb_cache")
     gid = args.gid
 
     gallery = load_gallery(gallery_path)
-    person_names = load_person_names(Path.home() / ".face_video_group" / "person_names.json")
+    person_names = load_person_names(default_names_path())
 
     folder = find_group_folder(output_dir, gid)
     if folder is None:

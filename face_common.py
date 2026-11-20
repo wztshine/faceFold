@@ -121,6 +121,27 @@ def dominant_vectors(embs: np.ndarray, link: float) -> np.ndarray:
     return best
 
 
+def default_state_dir() -> Path:
+    """项目状态目录（画廊/人名映射的默认父目录）。
+
+    优先 ~/.facefold；若不存在而旧版 ~/.face_video_group 存在，则沿用旧目录
+    （不迁移用户数据，老安装升级后画廊照常工作）。
+    """
+    new = Path.home() / ".facefold"
+    legacy = Path.home() / ".face_video_group"
+    if not new.exists() and legacy.exists():
+        return legacy
+    return new
+
+
+def default_gallery_path() -> Path:
+    return default_state_dir() / "face_gallery.npz"
+
+
+def default_names_path() -> Path:
+    return default_state_dir() / "person_names.json"
+
+
 def gid_of(name: str) -> str | None:
     """从文件夹名提取人物 ID。
 

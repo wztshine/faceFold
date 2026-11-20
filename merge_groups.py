@@ -30,6 +30,8 @@ from pathlib import Path
 import numpy as np
 
 from face_common import (
+    default_gallery_path,
+    default_names_path,
     dominant_vectors,
     find_group_folder,
     load_gallery,
@@ -175,7 +177,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="合并被误拆的同一个人分组")
     parser.add_argument("output_dir", type=Path, help="groups 输出目录")
     parser.add_argument("--gallery", type=Path, default=None,
-                        help="画廊文件，默认 ~/.face_video_group/face_gallery.npz（与 main.py 一致）")
+                        help="画廊文件，默认 ~/.facefold/face_gallery.npz（旧版 ~/.face_video_group 自动兼容，与 main.py 一致）")
     parser.add_argument("--pending", type=Path, default=None,
                         help="待移动视频列表，默认 output_dir/pending.txt（与 main.py 一致）")
     parser.add_argument("--sim_threshold", type=float, default=0.5,
@@ -193,7 +195,7 @@ def main() -> None:
     args = parser.parse_args()
 
     output_dir = args.output_dir
-    gallery_path = args.gallery or (Path.home() / ".face_video_group" / "face_gallery.npz")
+    gallery_path = args.gallery or default_gallery_path()
     pending_path = args.pending or (output_dir / "pending.txt")
 
     gallery = load_gallery(gallery_path)
@@ -202,7 +204,7 @@ def main() -> None:
         sys.exit(1)
 
     # 默认加载人物名映射（不存在时为空，不报错）
-    names_path = Path.home() / ".face_video_group" / "person_names.json"
+    names_path = default_names_path()
     person_names = load_person_names(names_path)
 
     # 清理残留：默认不自动删（纯 pending 分组没有文件夹，会被误删）。

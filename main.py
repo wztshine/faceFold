@@ -44,6 +44,8 @@ except ImportError:
 
 from face_common import (
     dedup_against_gallery,
+    default_gallery_path,
+    default_names_path,
     dominant_vectors,
     find_group_folder,
     gid_of,
@@ -52,7 +54,6 @@ from face_common import (
     load_person_names,
     person_folder_name,
     save_gallery,
-    save_person_names,
     save_pending,
 )
 
@@ -586,19 +587,19 @@ def main() -> None:
     parser.add_argument("--log", type=Path, default=None, help="日志文件路径，默认不写文件")
     parser.add_argument("--cache_dir", type=Path, default=None, help="特征缓存目录，默认 output_dir/emb_cache")
     parser.add_argument("--gallery", type=Path, default=None,
-                        help="画廊文件，默认 ~/.face_video_group/face_gallery.npz（跨目录/跨盘共享同一画廊）")
+                        help="画廊文件，默认 ~/.facefold/face_gallery.npz（旧版 ~/.face_video_group 自动兼容，跨目录/跨盘共享同一画廊）")
     parser.add_argument("--progress", type=Path, default=None, help="断点续跑进度文件，默认 output_dir/progress.txt")
     parser.add_argument("--pending", type=Path, default=None, help="待移动视频列表，默认 output_dir/pending.txt")
     parser.add_argument("--names", type=Path, default=None,
-                        help="人物名映射文件，默认 ~/.face_video_group/person_names.json（不存在时静默）")
+                        help="人物名映射文件，默认 ~/.facefold/person_names.json（不存在时静默）")
     args = parser.parse_args()
 
     output_dir = args.output_dir or (args.input_dir / "groups")
     report_path = args.report or (output_dir / "group_report.csv")
     cache_dir = args.cache_dir or (output_dir / "emb_cache")
-    default_gallery = Path.home() / ".face_video_group" / "face_gallery.npz"
+    default_gallery = default_gallery_path()
     gallery_path = args.gallery or default_gallery
-    names_path = args.names or (Path.home() / ".face_video_group" / "person_names.json")
+    names_path = args.names or default_names_path()
     progress_path = args.progress or (output_dir / "progress.txt")
     pending_path = args.pending or (output_dir / "pending.txt")
     setup_logging(args.log)

@@ -1,6 +1,6 @@
-# face-video-group
+# FaceFold
 
-将包含**相同人脸**的视频自动归入同一个文件夹。基于 insightface（ArcFace/buffalo_l）做人脸检测与特征提取，把含有同一个人（或同一组人）的视频归类整理。
+将包含**相同人脸**的视频自动归入同一个文件夹（**Face** + **Fold**：把同一张脸的视频"折"进各自的文件夹）。基于 insightface（ArcFace/buffalo_l）做人脸检测与特征提取，把含有同一个人（或同一组人）的视频归类整理。
 
 支持**断点续跑**（中断后自动跳过已处理视频）、**增量分类**（新增视频自动匹配已有分组）、**分组最少视频数**（同一人 ≥ N 个视频才建文件夹）和**分组合并**（事后修复被误拆的同一个人）。
 
@@ -27,8 +27,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 （uv 会自动下载所需的 Python 3.12 并创建虚拟环境，无需手动装 Python）
 
 ```bash
-git clone https://github.com/<你的用户名>/face_video_group.git
-cd face_video_group
+git clone https://github.com/<你的用户名>/facefold.git
+cd facefold
 uv sync
 ```
 
@@ -219,10 +219,10 @@ groups/
 |------|--------|------|
 | `--output_dir` | `input_dir/groups` | 分组输出目录 |
 | `--report` | `output_dir/group_report.csv` | 分组报告 CSV 路径（视频 → 分组对照） |
-| `--gallery` | `~/.face_video_group/face_gallery.npz` | 画廊文件路径（人物特征库，默认在用户目录，跨目录共享） |
+| `--gallery` | `~/.facefold/face_gallery.npz` | 画廊文件路径（人物特征库，默认在用户目录，跨目录共享） |
 | `--progress` | `output_dir/progress.txt` | 断点续跑进度文件路径 |
 | `--pending` | `output_dir/pending.txt` | 待移动视频列表路径 |
-| `--names` | `~/.face_video_group/person_names.json` | 人物名映射文件路径 |
+| `--names` | `~/.facefold/person_names.json` | 人物名映射文件路径 |
 | `--cache_dir` | `output_dir/emb_cache` | 特征缓存目录 |
 
 ### 运行参数
@@ -270,7 +270,7 @@ group_1        -> 张三_1        （合法，脚本识别为分组 1）
 
 ### 人物名映射（person_names.json）
 
-为了让名字"存一处、自动沿用"，可以编辑 `~/.face_video_group/person_names.json`：
+为了让名字"存一处、自动沿用"，可以编辑 `~/.facefold/person_names.json`：
 
 ```json
 {
@@ -330,7 +330,9 @@ group_1        -> 张三_1        （合法，脚本识别为分组 1）
 
 ### 画廊默认位置
 
-画廊默认存放在用户目录 `~/.face_video_group/face_gallery.npz`，跨目录/跨盘处理时**默认共享同一个画廊**。用 `--gallery` 可指定其他位置。
+画廊默认存放在用户目录 `~/.facefold/face_gallery.npz`，跨目录/跨盘处理时**默认共享同一个画廊**。用 `--gallery` 可指定其他位置。
+
+> 老版本用户兼容：若 `~/.facefold` 不存在而旧版 `~/.face_video_group` 存在，自动沿用旧目录（无需迁移数据）。
 
 ---
 
@@ -356,7 +358,7 @@ uv run python merge_groups.py "D:\videos\groups" --auto
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `output_dir` | （必填） | groups 输出目录 |
-| `--gallery` | `~/.face_video_group/face_gallery.npz` | 画廊文件路径（与 main.py 一致） |
+| `--gallery` | `~/.facefold/face_gallery.npz` | 画廊文件路径（与 main.py 一致） |
 | `--sim_threshold` | `0.5` | 向量对相似度阈值（与 main.py 一致） |
 | `--coverage_ratio` | `0.5` | 小分组主体被大分组主体覆盖的比例下限 |
 | `--strong_match_threshold` | `0.55` | 兜底强匹配阈值：即使覆盖比例不足，最大相似度超过该值也提示合并 |
@@ -414,7 +416,7 @@ uv run python split_group.py "D:\videos\groups" --gid 12
 |------|--------|------|
 | `output_dir` | （必填） | groups 输出目录 |
 | `--gid` | （必填） | 要拆分的分组 id（文件夹名的数字后缀） |
-| `--gallery` | `~/.face_video_group/face_gallery.npz` | 画廊文件（与 main.py 一致） |
+| `--gallery` | `~/.facefold/face_gallery.npz` | 画廊文件（与 main.py 一致） |
 | `--sim_threshold` | `0.5` | 两个视频算同一人所需的代表向量最大相似度 |
 | `--dry_run` | `false` | 只展示拆分方案，不移动视频、不写画廊 |
 | 其余 | 与 main.py 一致 | `--cluster_threshold` / `--gender` / `--frame_interval` 等特征提取参数 |
@@ -448,7 +450,7 @@ A：两种情况：① 视频未检出人脸；② 视频分到的组本轮视�
 ## 目录结构
 
 ```
-face_video_group/
+facefold/
 ├── main.py            # 主脚本：分组 + 断点续跑 + 增量分类
 ├── merge_groups.py    # 后处理工具：合并被误拆的同一个人分组
 ├── split_group.py     # 后处理工具：拆分被误并的分组

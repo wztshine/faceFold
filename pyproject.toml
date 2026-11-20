@@ -1,5 +1,5 @@
 [project]
-name = "face-video-group"
+name = "facefold"
 version = "0.1.0"
 description = "将含相同人脸的视频归入同一文件夹"
 readme = "README.md"
